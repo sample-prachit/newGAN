@@ -22,6 +22,9 @@ from custom_data import ImageAndMaskDataFromSinGAN
 policy = 'color,translation'
 import lpips
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 # Update the device initialization at the top of file
 if torch.backends.mps.is_available() and torch.backends.mps.is_built():
     device = torch.device("mps")
@@ -61,8 +64,8 @@ def train_d(net, data, label="real"):
         rec_small_img = rec_small[:, 0:1, :, :].contiguous()
         rec_part_img = rec_part[:, 0:1, :, :].contiguous()
 
-        # Make sure interpolated tensors are contiguous and on correct device
-        with torch.cuda.amp.autocast(enabled=False):
+        # Replace deprecated CUDA autocast
+        with torch.amp.autocast(device_type='cuda', enabled=False):
             interpolated_data = F.interpolate(data_img, rec_all.shape[2]).contiguous().to(device)
             interpolated_small = F.interpolate(data_img, rec_small.shape[2]).contiguous().to(device)
             interpolated_part = F.interpolate(crop_image_by_part(data_img, part), rec_part.shape[2]).contiguous().to(device)
@@ -204,6 +207,8 @@ def train(args):
     optimizerG = optim.Adam(netG.parameters(), lr=nlr, betas=(nbeta1, 0.999))
     optimizerD = optim.Adam(netD.parameters(), lr=nlr, betas=(nbeta1, 0.999))
     
+    backup_para = None  # Initialize backup_para
+    
     for iteration in tqdm(range(current_iteration, total_iterations+1)):
         real_image = next(dataloader).contiguous()
         real_image = real_image.to(device)
@@ -238,9 +243,6 @@ def train(args):
         if iteration % 100 == 0:
             print("GAN: loss d: %.5f    loss g: %.5f"%(err_dr, -err_g.item()))
 
-        if iteration % (save_interval*10) == 0:
-            print("GAN: loss d: %.5f    loss g: %.5f"%(err_dr, -err_g.item()))
-
         if iteration % validation_interval == 0:
             # Monitor losses
             if err_dr < 0.1 or err_g > 10:
@@ -248,29 +250,35 @@ def train(args):
             
             # Save latest images
             if iteration % (save_interval*10) == 0:
-                # Save generated samples - both channels
-                gen_output = netG(fixed_noise)[0]
-                vutils.save_image(gen_output[:,0:1].add(1).mul(0.5), 
-                                saved_image_folder+'/%d_img.png'%iteration, nrow=4)
-                vutils.save_image(gen_output[:,1:2].add(1).mul(0.5), 
-                                saved_image_folder+'/%d_mask.png'%iteration, nrow=4)
+                backup_para = copy_G_params(netG)  # Create backup before saving
+                load_params(netG, avg_param_G)
                 
-                # Save reconstruction samples
-                vutils.save_image(torch.cat([
-                        F.interpolate(real_image[:,0:1], 128),  # Image channel 
-                        rec_img_all[:,0:1],  # Reconstructed image
-                        rec_img_small[:,0:1],
-                        rec_img_part[:,0:1]]).add(1).mul(0.5), 
-                        saved_image_folder+'/rec_img_%d.png'%iteration)
+                with torch.no_grad():
+                    # Save generated samples - both channels
+                    gen_output = netG(fixed_noise)[0]
+                    vutils.save_image(gen_output[:,0:1].add(1).mul(0.5), 
+                                    saved_image_folder+'/%d_img.png'%iteration, nrow=4)
+                    vutils.save_image(gen_output[:,1:2].add(1).mul(0.5), 
+                                    saved_image_folder+'/%d_mask.png'%iteration, nrow=4)
+                    
+                    # Save reconstruction samples
+                    vutils.save_image(torch.cat([
+                            F.interpolate(real_image[:,0:1], 128),  # Image channel 
+                            rec_img_all[:,0:1],  # Reconstructed image
+                            rec_img_small[:,0:1],
+                            rec_img_part[:,0:1]]).add(1).mul(0.5), 
+                            saved_image_folder+'/rec_img_%d.png'%iteration)
+                    
+                    # Save mask reconstructions
+                    vutils.save_image(torch.cat([
+                            F.interpolate(real_image[:,1:2], 128),  # Mask channel
+                            rec_img_all[:,1:2],  # Reconstructed mask
+                            rec_img_small[:,1:2],
+                            rec_img_part[:,1:2]]).add(1).mul(0.5), 
+                            saved_image_folder+'/rec_mask_%d.png'%iteration)
                 
-                # Save mask reconstructions
-                vutils.save_image(torch.cat([
-                        F.interpolate(real_image[:,1:2], 128),  # Mask channel
-                        rec_img_all[:,1:2],  # Reconstructed mask
-                        rec_img_small[:,1:2],
-                        rec_img_part[:,1:2]]).add(1).mul(0.5), 
-                        saved_image_folder+'/rec_mask_%d.png'%iteration)
-            load_params(netG, backup_para)
+                if backup_para is not None:  # Only restore if backup exists
+                    load_params(netG, backup_para)
 
         if iteration % (save_interval*50) == 0 or iteration == total_iterations:
             backup_para = copy_G_params(netG)
