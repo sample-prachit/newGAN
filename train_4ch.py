@@ -25,15 +25,15 @@ import lpips
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Update the device initialization at the top of file
+# Move device initialization to top
 if torch.backends.mps.is_available() and torch.backends.mps.is_built():
     device = torch.device("mps")
 elif torch.cuda.is_available():
     device = torch.device("cuda:0")
 else:
     device = torch.device("cpu")
-    
-# Initialize LPIPS on the correct device
+
+# Initialize LPIPS on the correct device once
 percept = lpips.LPIPS(net='vgg').to(device)
 
 
@@ -51,58 +51,74 @@ def crop_image_by_part(image, part):
     if part==3:
         return image[:,:,hw:,hw:]
 
-def train_d(net, data, label="real"):
+def train_d(net, data, label="real", scaler=None):
     """Train function of discriminator"""
     if label=="real":
         part = random.randint(0, 3)
         data = data.contiguous()
-        pred, [rec_all, rec_small, rec_part] = net(data, label, part=part)
-        
-        # Handle single channel data
-        data_img = data[:,0:1, :, :].contiguous()
-        rec_all_img = rec_all[:, 0:1, :, :].contiguous()
-        rec_small_img = rec_small[:, 0:1, :, :].contiguous()
-        rec_part_img = rec_part[:, 0:1, :, :].contiguous()
+        # Update deprecated autocast
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            pred, [rec_all, rec_small, rec_part] = net(data, label, part=part)
+            
+            # Handle single channel data
+            data_img = data[:,0:1, :, :].contiguous()
+            rec_all_img = rec_all[:, 0:1, :, :].contiguous()
+            rec_small_img = rec_small[:, 0:1, :, :].contiguous()
+            rec_part_img = rec_part[:, 0:1, :, :].contiguous()
 
-        # Replace deprecated CUDA autocast
-        with torch.amp.autocast(device_type='cuda', enabled=False):
             interpolated_data = F.interpolate(data_img, rec_all.shape[2]).contiguous().to(device)
             interpolated_small = F.interpolate(data_img, rec_small.shape[2]).contiguous().to(device)
             interpolated_part = F.interpolate(crop_image_by_part(data_img, part), rec_part.shape[2]).contiguous().to(device)
 
-        err = F.relu(torch.rand_like(pred) * 0.2 + 0.8 - pred).mean() + \
-            percept(rec_all_img.to(device), interpolated_data).sum() + \
-            percept(rec_small_img.to(device), interpolated_small).sum() + \
-            percept(rec_part_img.to(device), interpolated_part).sum()
+            err = F.relu(torch.rand_like(pred) * 0.2 + 0.8 - pred).mean() + \
+                percept(rec_all_img.to(device), interpolated_data).sum() + \
+                percept(rec_small_img.to(device), interpolated_small).sum() + \
+                percept(rec_part_img.to(device), interpolated_part).sum()
         
-        err.backward()
+        scaler.scale(err).backward()
         return pred.mean().item(), rec_all, rec_small, rec_part
     else:
-        data = [d.contiguous() if isinstance(d, torch.Tensor) else [t.contiguous() for t in d] for d in data]
-        pred = net(data, label)
-        err = F.relu(torch.rand_like(pred) * 0.2 + 0.8 + pred).mean()
-        err.backward()
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            data = [d.contiguous() if isinstance(d, torch.Tensor) else [t.contiguous() for t in d] for d in data]
+            pred = net(data, label)
+            err = F.relu(torch.rand_like(pred) * 0.2 + 0.8 + pred).mean()
+        scaler.scale(err).backward()
         return pred.mean().item()
         
 
 def train(args):
-
-    #data_root = args.path
-    total_iterations = args.iter
-    checkpoint = args.ckpt
-    batch_size = args.batch_size * 2  # Double the batch size
+    # Network configuration
+    nz = 256  # latent vector size
+    ngf = 64  # generator feature size
+    ndf = 64  # discriminator feature size
+    
+    # Optimize hyperparameters for 20 images
+    total_iterations = 10000  # Reduce iterations
+    batch_size = 10  # Smaller batch size for better stability
     im_size = args.im_size
-    ndf = 64
-    ngf = 64
-    nz = 256
-    nlr = 0.0002
+    dataloader_workers = 2  # Reduce workers
+    
+    # Learning rate schedule
+    base_lr = 0.0001  # Lower learning rate for stability
     nbeta1 = 0.5
+    nbeta2 = 0.999
+    
+    # Gradient clipping value
+    grad_clip = 0.5
+    
+    # More frequent validation to catch instability
+    save_interval = 200
+    validation_interval = 500
+    
+    # Enable TF32 for better performance/stability balance
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    checkpoint = args.ckpt
+    im_size = args.im_size
     use_cuda = False
     multi_gpu = False  # Set to False since we're using CPU
-    dataloader_workers = 8  # Increase worker count
     current_iteration = 0
-    save_interval = 100  # Keep frequent saves to monitor progress
-    validation_interval = 1000  # Add validation check every 1000 iterations
     
     # Add early stopping
     best_fid = float('inf')
@@ -165,8 +181,10 @@ def train(args):
     # Enable CUDA optimizations
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     
-    # Pin memory and enable async data loading
+    # Pin memory and enable async data loading with optimal settings
     dataloader = iter(DataLoader(dataset, 
                                batch_size=effective_batch_size,
                                shuffle=False,
@@ -174,13 +192,13 @@ def train(args):
                                num_workers=dataloader_workers,
                                pin_memory=True,
                                persistent_workers=True,
-                               prefetch_factor=2))
-    
-    # Move LPIPS to GPU early
-    percept = percept.to(device)
+                               prefetch_factor=4))
     
     # Enable automatic mixed precision for faster training
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler()
+    
+    # Pre-fetch data to GPU
+    next_data = next(dataloader).to(device)
     
     #from model_s import Generator, Discriminator
     netG = Generator(ngf=ngf, nz=nz, im_size=im_size, nc=args.nc)
@@ -210,19 +228,35 @@ def train(args):
         netG = nn.DataParallel(netG.to(device))
         netD = nn.DataParallel(netD.to(device))
 
-    optimizerG = optim.Adam(netG.parameters(), lr=nlr, betas=(nbeta1, 0.999))
-    optimizerD = optim.Adam(netD.parameters(), lr=nlr, betas=(nbeta1, 0.999))
+    # Update optimizers with better parameters
+    optimizerG = optim.AdamW(
+        netG.parameters(),
+        lr=base_lr,
+        betas=(nbeta1, nbeta2),
+        weight_decay=0.01
+    )
+    optimizerD = optim.AdamW(
+        netD.parameters(),
+        lr=base_lr,
+        betas=(nbeta1, nbeta2),
+        weight_decay=0.01
+    )
+    
+    # Add learning rate schedulers
+    schedulerG = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerG, total_iterations)
+    schedulerD = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerD, total_iterations)
     
     backup_para = None  # Initialize backup_para
     
     for iteration in tqdm(range(current_iteration, total_iterations+1)):
-        real_image = next(dataloader).contiguous()
-        real_image = real_image.to(device)
+        real_image = next_data
+        # Pre-fetch next batch asynchronously
+        next_data = next(dataloader).to(device, non_blocking=True)
         current_batch_size = real_image.size(0)
         noise = torch.Tensor(current_batch_size, nz).normal_(0, 1).to(device)
         
         # Use AMP for forward/backward passes
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
             fake_images = netG(noise)
             if isinstance(fake_images, list):
                 fake_images = [f.contiguous() for f in fake_images]
@@ -233,8 +267,11 @@ def train(args):
             ## 2. train Discriminator
             netD.zero_grad()
 
-            err_dr, rec_img_all, rec_img_small, rec_img_part = train_d(netD, real_image, label="real")
-            train_d(netD, [fi.detach() for fi in fake_images], label="fake")
+            err_dr, rec_img_all, rec_img_small, rec_img_part = train_d(netD, real_image, label="real", scaler=scaler)
+            train_d(netD, [fi.detach() for fi in fake_images], label="fake", scaler=scaler)
+            
+            # Update discriminator
+            scaler.unscale_(optimizerD)
             scaler.step(optimizerD)
             
             ## 3. train Generator
@@ -242,14 +279,27 @@ def train(args):
             pred_g = netD(fake_images, "fake")
             err_g = -pred_g.mean()
 
+            # Scale and backprop generator loss
             scaler.scale(err_g).backward()
+            scaler.unscale_(optimizerG)
             scaler.step(optimizerG)
             scaler.update()
+            
+            # Add gradient clipping
+            torch.nn.utils.clip_grad_norm_(netD.parameters(), grad_clip)
+            torch.nn.utils.clip_grad_norm_(netG.parameters(), grad_clip)
+            
+            # Update learning rates
+            schedulerG.step()
+            schedulerD.step()
 
         for p, avg_p in zip(netG.parameters(), avg_param_G):
             avg_p.mul_(0.999).add_(0.001 * p.data)
 
+        # Monitor GPU memory usage
         if iteration % 100 == 0:
+            print(f"GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            print(f"Current LR: {schedulerG.get_last_lr()[0]:.6f}")
             print("GAN: loss d: %.5f    loss g: %.5f"%(err_dr, -err_g.item()))
 
         if iteration % validation_interval == 0:
@@ -308,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument('--name', type=str, default='test_4ch_num_img_5', help='experiment name')
     parser.add_argument('--iter', type=int, default=50000, help='number of iterations')
     parser.add_argument('--start_iter', type=int, default=0, help='the iteration to start training')
-    parser.add_argument('--batch_size', type=int, default=16, help='mini batch number of images')
+    parser.add_argument('--batch_size', type=int, default=10, help='mini batch number of images')
     parser.add_argument('--im_size', type=int, default=256, help='image resolution')
     parser.add_argument('--ckpt', type=str, default='None', help='checkpoint weight path if have one')
     # new parameters- added to process 4 channels data
