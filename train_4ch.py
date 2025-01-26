@@ -98,7 +98,14 @@ def train(args):
     multi_gpu = False  # Set to False since we're using CPU
     dataloader_workers = 2  # Reduce workers for CPU
     current_iteration = 0
-    save_interval = 100
+    save_interval = 100  # Keep frequent saves to monitor progress
+    validation_interval = 1000  # Add validation check every 1000 iterations
+    
+    # Add early stopping
+    best_fid = float('inf')
+    patience = 5
+    no_improve = 0
+    
     saved_model_folder, saved_image_folder = get_dir(args)
     
     # Update device initialization to properly check for MPS
@@ -232,9 +239,15 @@ def train(args):
             print("GAN: loss d: %.5f    loss g: %.5f"%(err_dr, -err_g.item()))
 
         if iteration % (save_interval*10) == 0:
-            backup_para = copy_G_params(netG)
-            load_params(netG, avg_param_G)
-            with torch.no_grad():
+            print("GAN: loss d: %.5f    loss g: %.5f"%(err_dr, -err_g.item()))
+
+        if iteration % validation_interval == 0:
+            # Monitor losses
+            if err_dr < 0.1 or err_g > 10:
+                print("Warning: Training may be unstable")
+            
+            # Save latest images
+            if iteration % (save_interval*10) == 0:
                 # Save generated samples - both channels
                 gen_output = netG(fixed_noise)[0]
                 vutils.save_image(gen_output[:,0:1].add(1).mul(0.5), 
