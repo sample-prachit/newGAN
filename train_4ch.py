@@ -90,7 +90,7 @@ def train(args):
     #data_root = args.path
     total_iterations = args.iter
     checkpoint = args.ckpt
-    batch_size = args.batch_size
+    batch_size = args.batch_size * 2  # Double the batch size
     im_size = args.im_size
     ndf = 64
     ngf = 64
@@ -99,7 +99,7 @@ def train(args):
     nbeta1 = 0.5
     use_cuda = False
     multi_gpu = False  # Set to False since we're using CPU
-    dataloader_workers = 2  # Reduce workers for CPU
+    dataloader_workers = 8  # Increase worker count
     current_iteration = 0
     save_interval = 100  # Keep frequent saves to monitor progress
     validation_interval = 1000  # Add validation check every 1000 iterations
@@ -162,19 +162,25 @@ def train(args):
     if effective_batch_size != args.batch_size:
         print(f"Warning: Reducing batch size to {effective_batch_size} to match dataset size")
     
+    # Enable CUDA optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    
+    # Pin memory and enable async data loading
     dataloader = iter(DataLoader(dataset, 
                                batch_size=effective_batch_size,
                                shuffle=False,
                                sampler=InfiniteSamplerWrapper(dataset),
                                num_workers=dataloader_workers,
-                               pin_memory=True))
-    '''
-    loader = MultiEpochsDataLoader(dataset, batch_size=batch_size, 
-                               shuffle=True, num_workers=dataloader_workers, 
-                               pin_memory=True)
-    dataloader = CudaDataLoader(loader, 'cuda')
-    '''
+                               pin_memory=True,
+                               persistent_workers=True,
+                               prefetch_factor=2))
     
+    # Move LPIPS to GPU early
+    percept = percept.to(device)
+    
+    # Enable automatic mixed precision for faster training
+    scaler = torch.cuda.amp.GradScaler()
     
     #from model_s import Generator, Discriminator
     netG = Generator(ngf=ngf, nz=nz, im_size=im_size, nc=args.nc)
@@ -214,28 +220,31 @@ def train(args):
         real_image = real_image.to(device)
         current_batch_size = real_image.size(0)
         noise = torch.Tensor(current_batch_size, nz).normal_(0, 1).to(device)
-
-        fake_images = netG(noise)
-        if isinstance(fake_images, list):
-            fake_images = [f.contiguous() for f in fake_images]
-
-        real_image = DiffAugment(real_image, policy=policy)
-        fake_images = [DiffAugment(fake.contiguous(), policy=policy) for fake in fake_images]
         
-        ## 2. train Discriminator
-        netD.zero_grad()
+        # Use AMP for forward/backward passes
+        with torch.cuda.amp.autocast():
+            fake_images = netG(noise)
+            if isinstance(fake_images, list):
+                fake_images = [f.contiguous() for f in fake_images]
 
-        err_dr, rec_img_all, rec_img_small, rec_img_part = train_d(netD, real_image, label="real")
-        train_d(netD, [fi.detach() for fi in fake_images], label="fake")
-        optimizerD.step()
-        
-        ## 3. train Generator
-        netG.zero_grad()
-        pred_g = netD(fake_images, "fake")
-        err_g = -pred_g.mean()
+            real_image = DiffAugment(real_image, policy=policy)
+            fake_images = [DiffAugment(fake.contiguous(), policy=policy) for fake in fake_images]
+            
+            ## 2. train Discriminator
+            netD.zero_grad()
 
-        err_g.backward()
-        optimizerG.step()
+            err_dr, rec_img_all, rec_img_small, rec_img_part = train_d(netD, real_image, label="real")
+            train_d(netD, [fi.detach() for fi in fake_images], label="fake")
+            scaler.step(optimizerD)
+            
+            ## 3. train Generator
+            netG.zero_grad()
+            pred_g = netD(fake_images, "fake")
+            err_g = -pred_g.mean()
+
+            scaler.scale(err_g).backward()
+            scaler.step(optimizerG)
+            scaler.update()
 
         for p, avg_p in zip(netG.parameters(), avg_param_G):
             avg_p.mul_(0.999).add_(0.001 * p.data)
@@ -299,7 +308,7 @@ if __name__ == "__main__":
     parser.add_argument('--name', type=str, default='test_4ch_num_img_5', help='experiment name')
     parser.add_argument('--iter', type=int, default=50000, help='number of iterations')
     parser.add_argument('--start_iter', type=int, default=0, help='the iteration to start training')
-    parser.add_argument('--batch_size', type=int, default=4, help='mini batch number of images')
+    parser.add_argument('--batch_size', type=int, default=16, help='mini batch number of images')
     parser.add_argument('--im_size', type=int, default=256, help='image resolution')
     parser.add_argument('--ckpt', type=str, default='None', help='checkpoint weight path if have one')
     # new parameters- added to process 4 channels data
